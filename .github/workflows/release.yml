@@ -73,9 +73,15 @@ jobs:
           name: windows-bundles
           path: bundles/windows
 
+      - name: List bundles
+        run: |
+          echo "Tag: ${{ github.ref_name }}"
+          ls -R bundles || true
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ github.token }}
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
