@@ -37,13 +37,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Tauri prerequisites
-      - name: Install Tauri deps (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          # Ensure Xcode CLI tools (usually present on GitHub hosted runners)
-          xcode-select -p
-
       - name: Install Tauri deps (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -63,9 +56,28 @@ jobs:
           path: |
             src-tauri/target/release/bundle/**
 
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download macOS bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-bundles
+          path: bundles/macos
+
+      - name: Download Windows bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-bundles
+          path: bundles/windows
+
       - name: Create GitHub Release
-        if: runner.os == 'macOS'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
           files: |
-            src-tauri/target/release/bundle/**
+            bundles/**/*
