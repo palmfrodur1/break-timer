@@ -155,11 +155,14 @@ function nextDurationMs(state: State) {
 
 // (removed unused helper)
 
+let popupContext: "work-ended" | "break-ended" | null = null;
+
 async function showBreakPopup() {
+  popupContext = "work-ended";
   const popup = $("popup") as HTMLElement;
-  ( $("popup-title") as HTMLElement).textContent = "Time for a break";
-  ( $("popup-text") as HTMLElement).textContent = "Stand up, move a bit, drink water.";
-  ( $("btn-break") as HTMLButtonElement).textContent = "Start break";
+  ($("popup-title") as HTMLElement).textContent = "Time for a break";
+  ($("popup-text") as HTMLElement).textContent = "Stand up, move a bit, drink water.";
+  ($("btn-break") as HTMLButtonElement).textContent = "Start break";
   show(popup);
   await focusAndTop();
   beep();
@@ -167,10 +170,11 @@ async function showBreakPopup() {
 }
 
 async function showBackToWorkPopup() {
+  popupContext = "break-ended";
   const popup = $("popup") as HTMLElement;
-  ( $("popup-title") as HTMLElement).textContent = "Back to work";
-  ( $("popup-text") as HTMLElement).textContent = "Break is done. Ready for another round?";
-  ( $("btn-break") as HTMLButtonElement).textContent = "Start work";
+  ($("popup-title") as HTMLElement).textContent = "Back to work";
+  ($("popup-text") as HTMLElement).textContent = "Break is done. Ready for another round?";
+  ($("btn-break") as HTMLButtonElement).textContent = "Start work";
   show(popup);
   await focusAndTop();
   beep();
@@ -332,6 +336,7 @@ async function main() {
   // Popup controls
   btnSnooze.addEventListener("click", async () => {
     // Snooze means: keep working for 5 more minutes.
+    popupContext = null;
     hide(popup);
     await dropTop();
     state.mode = "work";
@@ -339,18 +344,18 @@ async function main() {
   });
 
   btnBreak.addEventListener("click", async () => {
-    const title = ( $("popup-title") as HTMLElement).textContent || "";
     hide(popup);
     await dropTop();
 
-    if (title.toLowerCase().includes("back to work")) {
-      // Start a new work session
+    if (popupContext === "break-ended") {
+      popupContext = null;
       state.mode = "work";
       startCountdown(msFromMinutes(state.settings.workMinutes));
       return;
     }
 
-    // Start break
+    // default: work ended → start break
+    popupContext = null;
     state.mode = "break";
     startCountdown(msFromMinutes(state.settings.breakMinutes));
   });
