@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
 
 type Mode = "idle" | "work" | "break";
 
@@ -115,10 +115,25 @@ function notify(title: string, body?: string) {
 }
 
 function beep() {
-  const audio = document.getElementById("beep") as HTMLAudioElement | null;
-  audio?.play().catch(() => {
-    // ignore autoplay restrictions
-  });
+  // Use WebAudio so we don't depend on autoplay policies / silent placeholder audio.
+  try {
+    const AudioCtx = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext;
+    const ctx = new AudioCtx();
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = "sine";
+    o.frequency.value = 880;
+    g.gain.value = 0.04;
+    o.connect(g);
+    g.connect(ctx.destination);
+    o.start();
+    setTimeout(() => {
+      o.stop();
+      ctx.close().catch(() => {});
+    }, 350);
+  } catch {
+    // ignore
+  }
 }
 
 function computeRemaining(state: State, nowMs: number) {
@@ -132,8 +147,10 @@ async function focusAndTop() {
   try {
     const w = getCurrentWindow();
     await w.show();
-    await w.setFocus();
+    await w.unminimize();
     await w.setAlwaysOnTop(true);
+    await w.setFocus();
+    await w.requestUserAttention(UserAttentionType.Critical);
   } catch (e) {
     console.warn("focusAndTop failed", e);
   }
