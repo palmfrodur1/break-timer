@@ -115,22 +115,48 @@ function notify(title: string, body?: string) {
 }
 
 function beep() {
-  // Use WebAudio so we don't depend on autoplay policies / silent placeholder audio.
+  // Alarm-ish sound: loud-ish, repeating beeps with a bit of frequency movement.
+  // Uses WebAudio to avoid relying on media autoplay.
   try {
     const AudioCtx = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext;
     const ctx = new AudioCtx();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.type = "sine";
-    o.frequency.value = 880;
-    g.gain.value = 0.04;
-    o.connect(g);
-    g.connect(ctx.destination);
-    o.start();
+
+    const master = ctx.createGain();
+    // Keep under ~0.2 to avoid clipping; still much louder than before.
+    master.gain.value = 0.18;
+    master.connect(ctx.destination);
+
+    const startAt = ctx.currentTime + 0.01;
+
+    // pattern: 10 beeps, 140ms on, 110ms off (~2.5s)
+    for (let i = 0; i < 10; i++) {
+      const t0 = startAt + i * 0.25;
+      const t1 = t0 + 0.14;
+
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+
+      // Slightly harsh wave for alarm feel
+      o.type = "square";
+      // Sweep a bit so it doesn't sound like a single tone
+      o.frequency.setValueAtTime(880, t0);
+      o.frequency.linearRampToValueAtTime(1040, t1);
+
+      // Envelope to prevent clicks
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.exponentialRampToValueAtTime(1.0, t0 + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t1);
+
+      o.connect(g);
+      g.connect(master);
+      o.start(t0);
+      o.stop(t1 + 0.01);
+    }
+
+    // Close shortly after last beep.
     setTimeout(() => {
-      o.stop();
       ctx.close().catch(() => {});
-    }, 350);
+    }, 3200);
   } catch {
     // ignore
   }
