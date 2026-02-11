@@ -11,6 +11,8 @@ type Mode = "idle" | "work" | "break";
 type Settings = {
   workMinutes: number;
   breakMinutes: number;
+  longBreakMinutes: number;
+  longBreakEvery: number; // number of work->break loops before long break
 };
 
 type Awaiting = "none" | "break" | "work";
@@ -21,13 +23,23 @@ type State = {
   running: boolean;
   endsAtMs: number | null;
   remainingMs: number; // only used when paused/idle
+  // feature: long break
+  loopsSinceLongBreak: number;
+  isNextBreakLong: boolean;
+  // feature: next task prompt
+  nextTask: string;
   settings: Settings;
 };
 
-const DEFAULTS: Settings = { workMinutes: 25, breakMinutes: 5 };
+const DEFAULTS: Settings = {
+  workMinutes: 25,
+  breakMinutes: 5,
+  longBreakMinutes: 15,
+  longBreakEvery: 4,
+};
 
-const LS_SETTINGS = "breakTimer.settings.v1";
-const LS_STATE = "breakTimer.state.v1";
+const LS_SETTINGS = "breakTimer.settings.v2";
+const LS_STATE = "breakTimer.state.v2";
 
 function clamp(n: number, min: number, max: number) {
   return Math.max(min, Math.min(max, n));
@@ -41,6 +53,16 @@ function readSettings(): Settings {
     return {
       workMinutes: clamp(Number(j.workMinutes ?? DEFAULTS.workMinutes), 1, 240),
       breakMinutes: clamp(Number(j.breakMinutes ?? DEFAULTS.breakMinutes), 1, 120),
+      longBreakMinutes: clamp(
+        Number(j.longBreakMinutes ?? DEFAULTS.longBreakMinutes),
+        1,
+        240
+      ),
+      longBreakEvery: clamp(
+        Number(j.longBreakEvery ?? DEFAULTS.longBreakEvery),
+        2,
+        20
+      ),
     };
   } catch {
     return DEFAULTS;
@@ -55,7 +77,16 @@ function readState(): Omit<State, "settings"> {
   try {
     const raw = localStorage.getItem(LS_STATE);
     if (!raw) {
-      return { mode: "idle", awaiting: "none", running: false, endsAtMs: null, remainingMs: 0 };
+      return {
+        mode: "idle",
+        awaiting: "none",
+        running: false,
+        endsAtMs: null,
+        remainingMs: 0,
+        loopsSinceLongBreak: 0,
+        isNextBreakLong: false,
+        nextTask: "",
+      };
     }
     const j = JSON.parse(raw);
     return {
@@ -64,9 +95,22 @@ function readState(): Omit<State, "settings"> {
       running: Boolean(j.running),
       endsAtMs: typeof j.endsAtMs === "number" ? j.endsAtMs : null,
       remainingMs: typeof j.remainingMs === "number" ? j.remainingMs : 0,
+      loopsSinceLongBreak:
+        typeof j.loopsSinceLongBreak === "number" ? j.loopsSinceLongBreak : 0,
+      isNextBreakLong: Boolean(j.isNextBreakLong),
+      nextTask: typeof j.nextTask === "string" ? j.nextTask : "",
     };
   } catch {
-    return { mode: "idle", awaiting: "none", running: false, endsAtMs: null, remainingMs: 0 };
+    return {
+      mode: "idle",
+      awaiting: "none",
+      running: false,
+      endsAtMs: null,
+      remainingMs: 0,
+      loopsSinceLongBreak: 0,
+      isNextBreakLong: false,
+      nextTask: "",
+    };
   }
 }
 
@@ -126,35 +170,26 @@ function notify(title: string, body?: string) {
   }
 }
 
-function beep() {
-  // Alarm-ish sound: loud-ish, repeating beeps with a bit of frequency movement.
-  // Uses WebAudio to avoid relying on media autoplay.
+function alarm() {
+  // Loud-ish repeating beeps; still respects system volume.
   try {
     const AudioCtx = (window.AudioContext || (window as any).webkitAudioContext) as typeof AudioContext;
     const ctx = new AudioCtx();
-
     const master = ctx.createGain();
-    // Keep under ~0.2 to avoid clipping; still much louder than before.
     master.gain.value = 0.18;
     master.connect(ctx.destination);
 
     const startAt = ctx.currentTime + 0.01;
-
-    // pattern: 10 beeps, 140ms on, 110ms off (~2.5s)
     for (let i = 0; i < 10; i++) {
       const t0 = startAt + i * 0.25;
       const t1 = t0 + 0.14;
 
       const o = ctx.createOscillator();
       const g = ctx.createGain();
-
-      // Slightly harsh wave for alarm feel
       o.type = "square";
-      // Sweep a bit so it doesn't sound like a single tone
       o.frequency.setValueAtTime(880, t0);
       o.frequency.linearRampToValueAtTime(1040, t1);
 
-      // Envelope to prevent clicks
       g.gain.setValueAtTime(0.0001, t0);
       g.gain.exponentialRampToValueAtTime(1.0, t0 + 0.01);
       g.gain.exponentialRampToValueAtTime(0.0001, t1);
@@ -165,7 +200,6 @@ function beep() {
       o.stop(t1 + 0.01);
     }
 
-    // Close shortly after last beep.
     setTimeout(() => {
       ctx.close().catch(() => {});
     }, 3200);
@@ -189,8 +223,8 @@ async function focusAndTop() {
     await w.setAlwaysOnTop(true);
     await w.setFocus();
     await w.requestUserAttention(UserAttentionType.Critical);
-  } catch (e) {
-    console.warn("focusAndTop failed", e);
+  } catch {
+    // ignore
   }
 }
 
@@ -198,8 +232,8 @@ async function dropTop() {
   try {
     const w = getCurrentWindow();
     await w.setAlwaysOnTop(false);
-  } catch (e) {
-    console.warn("dropTop failed", e);
+  } catch {
+    // ignore
   }
 }
 
@@ -211,19 +245,11 @@ function modeLabel(mode: Mode) {
 
 function hintLabel(state: State) {
   if (state.mode === "work") return "Focus time.";
-  if (state.mode === "break") return "Pause time.";
+  if (state.mode === "break") return state.isNextBreakLong ? "Long break." : "Pause time.";
   return "Set your durations, then press Start.";
 }
 
-function nextDurationMs(state: State) {
-  if (state.mode === "break") return msFromMinutes(state.settings.breakMinutes);
-  return msFromMinutes(state.settings.workMinutes);
-}
-
-// (removed unused helper)
-
 let popupContext: "work-ended" | "break-ended" | null = null;
-
 let nagTimer: number | null = null;
 
 function stopNag() {
@@ -235,7 +261,6 @@ function stopNag() {
 
 function startNag(kind: "break" | "work") {
   stopNag();
-  // Repeat attention request + notification every 30s until user acknowledges.
   nagTimer = window.setInterval(async () => {
     try {
       const w = getCurrentWindow();
@@ -252,36 +277,6 @@ function startNag(kind: "break" | "work") {
   }, 30_000);
 }
 
-async function showBreakPopup() {
-  popupContext = "work-ended";
-  const popup = $("popup") as HTMLElement;
-  ($("popup-title") as HTMLElement).textContent = "Time for a break";
-  ($("popup-text") as HTMLElement).textContent = "Stand up, move a bit, drink water.";
-  ($("btn-break") as HTMLButtonElement).textContent = "Start break";
-  show(popup);
-
-  await ensureNotificationPermission();
-  await focusAndTop();
-  beep();
-  notify("Break timer", "Time for a break");
-  startNag("break");
-}
-
-async function showBackToWorkPopup() {
-  popupContext = "break-ended";
-  const popup = $("popup") as HTMLElement;
-  ($("popup-title") as HTMLElement).textContent = "Back to work";
-  ($("popup-text") as HTMLElement).textContent = "Break is done. Ready for another round?";
-  ($("btn-break") as HTMLButtonElement).textContent = "Start work";
-  show(popup);
-
-  await ensureNotificationPermission();
-  await focusAndTop();
-  beep();
-  notify("Break timer", "Break is done — back to work");
-  startNag("work");
-}
-
 async function main() {
   await ensureNotificationPermission();
 
@@ -295,21 +290,15 @@ async function main() {
     running: persisted.running,
     endsAtMs: persisted.endsAtMs,
     remainingMs: persisted.remainingMs,
+    loopsSinceLongBreak: persisted.loopsSinceLongBreak,
+    isNextBreakLong: persisted.isNextBreakLong,
+    nextTask: persisted.nextTask,
   };
 
-  // Normalize persisted state (avoid getting stuck showing WORKING 00:00 after reload).
-  // If we are not running and not explicitly awaiting an action, show a sane default.
-  if (!state.running && state.awaiting === "none") {
-    if (state.remainingMs <= 0) {
-      state.mode = "idle";
-      state.endsAtMs = null;
-      state.remainingMs = msFromMinutes(settings.workMinutes);
-    }
-  }
-
-  // If idle, ensure it has a countdown value.
-  if (state.mode === "idle" && state.remainingMs <= 0) {
-    state.remainingMs = msFromMinutes(settings.workMinutes);
+  // normalize
+  if (!state.running && state.remainingMs <= 0 && state.awaiting === "none") {
+    state.mode = "idle";
+    state.remainingMs = msFromMinutes(state.settings.workMinutes);
   }
 
   // UI refs
@@ -318,6 +307,8 @@ async function main() {
   const hintEl = $("hint");
   const workMinEl = $("work-min");
   const breakMinEl = $("break-min");
+  const longBreakMinEl = $("long-break-min");
+  const longBreakEveryEl = $("long-break-every");
 
   const btnStart = $("btn-start") as HTMLButtonElement;
   const btnPause = $("btn-pause") as HTMLButtonElement;
@@ -327,6 +318,8 @@ async function main() {
   const btnSettings = $("btn-settings") as HTMLButtonElement;
   const setWork = $("set-work") as HTMLInputElement;
   const setBreak = $("set-break") as HTMLInputElement;
+  const setLongBreak = $("set-long-break") as HTMLInputElement;
+  const setLongBreakEvery = $("set-long-break-every") as HTMLInputElement;
   const btnSettingsCancel = $("btn-settings-cancel") as HTMLButtonElement;
   const btnSettingsSave = $("btn-settings-save") as HTMLButtonElement;
   const btnResetData = $("btn-reset-data") as HTMLButtonElement;
@@ -336,6 +329,10 @@ async function main() {
   const popup = $("popup") as HTMLElement;
   const btnSnooze = $("btn-snooze") as HTMLButtonElement;
   const btnBreak = $("btn-break") as HTMLButtonElement;
+  const nextTaskWrap = $("next-task-wrap") as HTMLElement;
+  const nextTaskInput = $("next-task") as HTMLInputElement;
+  const taskReminder = $("task-reminder") as HTMLElement;
+  const taskReminderText = $("task-reminder-text") as HTMLElement;
 
   function persist() {
     writeSettings(state.settings);
@@ -345,6 +342,9 @@ async function main() {
       running: state.running,
       endsAtMs: state.endsAtMs,
       remainingMs: state.remainingMs,
+      loopsSinceLongBreak: state.loopsSinceLongBreak,
+      isNextBreakLong: state.isNextBreakLong,
+      nextTask: state.nextTask,
     });
   }
 
@@ -354,11 +354,12 @@ async function main() {
 
     workMinEl.textContent = String(state.settings.workMinutes);
     breakMinEl.textContent = String(state.settings.breakMinutes);
+    longBreakMinEl.textContent = String(state.settings.longBreakMinutes);
+    longBreakEveryEl.textContent = String(state.settings.longBreakEvery);
 
     btnStart.disabled = state.running;
     btnPause.disabled = !state.running;
 
-    // reset to appropriate default for current mode
     const now = Date.now();
     const remaining = computeRemaining(state, now);
     timeEl.textContent = fmt(remaining);
@@ -383,12 +384,71 @@ async function main() {
   }
 
   function resetCountdown() {
-    const dur = nextDurationMs(state);
     state.running = false;
     state.endsAtMs = null;
-    state.remainingMs = dur;
+    if (state.mode === "break") {
+      state.remainingMs = msFromMinutes(
+        state.isNextBreakLong ? state.settings.longBreakMinutes : state.settings.breakMinutes
+      );
+    } else {
+      state.remainingMs = msFromMinutes(state.settings.workMinutes);
+    }
     persist();
     syncUi();
+  }
+
+  function computeNextBreakIsLong() {
+    // long break after N completed work sessions
+    const nextLoops = state.loopsSinceLongBreak + 1;
+    return nextLoops % state.settings.longBreakEvery === 0;
+  }
+
+  async function showBreakPopup() {
+    popupContext = "work-ended";
+    // decide long break for next break
+    state.isNextBreakLong = computeNextBreakIsLong();
+
+    nextTaskInput.value = "";
+    show(nextTaskWrap);
+    hide(taskReminder);
+
+    ( $("popup-title") as HTMLElement).textContent = state.isNextBreakLong ? "Time for a long break" : "Time for a break";
+    ( $("popup-text") as HTMLElement).textContent = "Before the break starts, write what you will do after the break.";
+    ( $("btn-break") as HTMLButtonElement).textContent = state.isNextBreakLong ? "Start long break" : "Start break";
+
+    show(popup);
+    await ensureNotificationPermission();
+    await focusAndTop();
+    alarm();
+    notify("Break timer", state.isNextBreakLong ? "Time for a long break" : "Time for a break");
+    startNag("break");
+    persist();
+    syncUi();
+  }
+
+  async function showBackToWorkPopup() {
+    popupContext = "break-ended";
+
+    hide(nextTaskWrap);
+    if (state.nextTask.trim()) {
+      taskReminderText.textContent = state.nextTask.trim();
+      show(taskReminder);
+    } else {
+      hide(taskReminder);
+    }
+
+    ( $("popup-title") as HTMLElement).textContent = "Back to work";
+    ( $("popup-text") as HTMLElement).textContent = state.nextTask.trim()
+      ? "Go start the thing you wrote."
+      : "Break is done. Ready for another round?";
+    ( $("btn-break") as HTMLButtonElement).textContent = "Start work";
+
+    show(popup);
+    await ensureNotificationPermission();
+    await focusAndTop();
+    alarm();
+    notify("Break timer", "Break is done — back to work");
+    startNag("work");
   }
 
   async function onWorkEnded() {
@@ -415,8 +475,9 @@ async function main() {
   btnSettings.addEventListener("click", async () => {
     setWork.value = String(state.settings.workMinutes);
     setBreak.value = String(state.settings.breakMinutes);
+    setLongBreak.value = String(state.settings.longBreakMinutes);
+    setLongBreakEvery.value = String(state.settings.longBreakEvery);
 
-    // Update notification status each time settings opens.
     const enabled = await notificationsEnabled();
     notifStatus.textContent = enabled
       ? "Enabled"
@@ -424,6 +485,7 @@ async function main() {
 
     show(settingsModal);
   });
+
   btnSettingsCancel.addEventListener("click", () => hide(settingsModal));
 
   btnTestNotif.addEventListener("click", async () => {
@@ -436,7 +498,6 @@ async function main() {
   });
 
   btnResetData.addEventListener("click", () => {
-    // Clear persisted settings + state and reset to defaults.
     localStorage.removeItem(LS_SETTINGS);
     localStorage.removeItem(LS_STATE);
 
@@ -446,6 +507,9 @@ async function main() {
     state.running = false;
     state.endsAtMs = null;
     state.remainingMs = msFromMinutes(state.settings.workMinutes);
+    state.loopsSinceLongBreak = 0;
+    state.isNextBreakLong = false;
+    state.nextTask = "";
 
     persist();
     syncUi();
@@ -453,18 +517,28 @@ async function main() {
   });
 
   btnSettingsSave.addEventListener("click", () => {
-    const w = clamp(Number(setWork.value || 25), 1, 240);
-    const b = clamp(Number(setBreak.value || 5), 1, 120);
-    state.settings = { workMinutes: w, breakMinutes: b };
+    state.settings = {
+      workMinutes: clamp(Number(setWork.value || DEFAULTS.workMinutes), 1, 240),
+      breakMinutes: clamp(Number(setBreak.value || DEFAULTS.breakMinutes), 1, 120),
+      longBreakMinutes: clamp(
+        Number(setLongBreak.value || DEFAULTS.longBreakMinutes),
+        1,
+        240
+      ),
+      longBreakEvery: clamp(
+        Number(setLongBreakEvery.value || DEFAULTS.longBreakEvery),
+        2,
+        20
+      ),
+    };
 
-    // If idle, update displayed default.
     if (!state.running) {
-      if (state.mode === "idle") {
-        state.remainingMs = msFromMinutes(w);
-      } else if (state.mode === "work") {
-        state.remainingMs = msFromMinutes(w);
+      if (state.mode === "break") {
+        state.remainingMs = msFromMinutes(
+          state.isNextBreakLong ? state.settings.longBreakMinutes : state.settings.breakMinutes
+        );
       } else {
-        state.remainingMs = msFromMinutes(b);
+        state.remainingMs = msFromMinutes(state.settings.workMinutes);
       }
     }
 
@@ -477,12 +551,15 @@ async function main() {
   btnStart.addEventListener("click", () => {
     stopNag();
 
-    // If we're waiting for an action after a popup, Start should do the right thing.
     if (state.awaiting === "break") {
       state.mode = "break";
-      startCountdown(msFromMinutes(state.settings.breakMinutes));
+      const dur = msFromMinutes(
+        state.isNextBreakLong ? state.settings.longBreakMinutes : state.settings.breakMinutes
+      );
+      startCountdown(dur);
       return;
     }
+
     if (state.awaiting === "work") {
       state.mode = "work";
       startCountdown(msFromMinutes(state.settings.workMinutes));
@@ -490,21 +567,14 @@ async function main() {
     }
 
     if (state.mode === "idle") state.mode = "work";
-    startCountdown(state.remainingMs || nextDurationMs(state));
+    startCountdown(state.remainingMs || msFromMinutes(state.settings.workMinutes));
   });
 
   btnPause.addEventListener("click", () => pauseCountdown());
-  btnReset.addEventListener("click", () => {
-    if (state.mode === "idle") {
-      state.remainingMs = msFromMinutes(state.settings.workMinutes);
-    }
-    resetCountdown();
-  });
+  btnReset.addEventListener("click", () => resetCountdown());
 
   // Popup controls
   btnSnooze.addEventListener("click", async () => {
-    // Snooze means: keep working for 5 more minutes.
-    console.log("popup:snooze");
     stopNag();
     popupContext = null;
     state.awaiting = "none";
@@ -517,28 +587,40 @@ async function main() {
   });
 
   btnBreak.addEventListener("click", async () => {
-    console.log("popup:primary", { popupContext, awaiting: state.awaiting });
     stopNag();
     hide(popup);
 
     if (popupContext === "break-ended" || state.awaiting === "work") {
       popupContext = null;
+      // Clear task after we show it.
+      state.nextTask = "";
       state.mode = "work";
       startCountdown(msFromMinutes(state.settings.workMinutes));
       await dropTop();
       return;
     }
 
-    // default: work ended → start break
+    // work ended -> start break
     popupContext = null;
+
+    // Store next task (one-shot)
+    state.nextTask = nextTaskInput.value.trim();
+
+    // Update loops counter; reset when long break is taken
+    state.loopsSinceLongBreak += 1;
+    const longNow = state.isNextBreakLong;
+    if (longNow) {
+      state.loopsSinceLongBreak = 0;
+    }
+
     state.mode = "break";
-    startCountdown(msFromMinutes(state.settings.breakMinutes));
+    const dur = msFromMinutes(longNow ? state.settings.longBreakMinutes : state.settings.breakMinutes);
+    startCountdown(dur);
 
     await dropTop();
   });
 
-  // Allow Rust tray menu to bring the window back
-  // (no-op if not called)
+  // (no-op; used by tray)
   (window as any).__breakTimerShow = async () => {
     await invoke("show_main_window");
   };
@@ -546,17 +628,14 @@ async function main() {
   // Tick loop
   syncUi();
 
-  setInterval(async () => {
+  window.setInterval(async () => {
     const now = Date.now();
     const remaining = computeRemaining(state, now);
-
-    // update time display
     timeEl.textContent = fmt(remaining);
 
     if (!state.running) return;
 
     if (remaining <= 0) {
-      // stop running and trigger state transitions
       if (state.mode === "work") {
         await onWorkEnded();
       } else if (state.mode === "break") {
