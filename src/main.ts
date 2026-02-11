@@ -129,15 +129,23 @@ function computeRemaining(state: State, nowMs: number) {
 }
 
 async function focusAndTop() {
-  const w = getCurrentWindow();
-  await w.show();
-  await w.setFocus();
-  await w.setAlwaysOnTop(true);
+  try {
+    const w = getCurrentWindow();
+    await w.show();
+    await w.setFocus();
+    await w.setAlwaysOnTop(true);
+  } catch (e) {
+    console.warn("focusAndTop failed", e);
+  }
 }
 
 async function dropTop() {
-  const w = getCurrentWindow();
-  await w.setAlwaysOnTop(false);
+  try {
+    const w = getCurrentWindow();
+    await w.setAlwaysOnTop(false);
+  } catch (e) {
+    console.warn("dropTop failed", e);
+  }
 }
 
 function modeLabel(mode: Mode) {
@@ -387,22 +395,26 @@ async function main() {
   // Popup controls
   btnSnooze.addEventListener("click", async () => {
     // Snooze means: keep working for 5 more minutes.
+    console.log("popup:snooze");
     popupContext = null;
     state.awaiting = "none";
     hide(popup);
-    await dropTop();
+
     state.mode = "work";
     startCountdown(msFromMinutes(5));
+
+    await dropTop();
   });
 
   btnBreak.addEventListener("click", async () => {
+    console.log("popup:primary", { popupContext, awaiting: state.awaiting });
     hide(popup);
-    await dropTop();
 
     if (popupContext === "break-ended" || state.awaiting === "work") {
       popupContext = null;
       state.mode = "work";
       startCountdown(msFromMinutes(state.settings.workMinutes));
+      await dropTop();
       return;
     }
 
@@ -410,6 +422,8 @@ async function main() {
     popupContext = null;
     state.mode = "break";
     startCountdown(msFromMinutes(state.settings.breakMinutes));
+
+    await dropTop();
   });
 
   // Allow Rust tray menu to bring the window back
