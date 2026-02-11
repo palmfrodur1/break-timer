@@ -200,6 +200,17 @@ async function main() {
     remainingMs: persisted.remainingMs,
   };
 
+  // Normalize persisted state (avoid getting stuck showing WORKING 00:00 after reload).
+  // If we are not running and not explicitly awaiting an action, show a sane default.
+  if (!state.running && state.awaiting === "none") {
+    if (state.remainingMs <= 0) {
+      state.mode = "idle";
+      state.endsAtMs = null;
+      state.remainingMs = msFromMinutes(settings.workMinutes);
+    }
+  }
+
+  // If idle, ensure it has a countdown value.
   if (state.mode === "idle" && state.remainingMs <= 0) {
     state.remainingMs = msFromMinutes(settings.workMinutes);
   }
