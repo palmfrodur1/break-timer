@@ -1,5 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, UserAttentionType } from "@tauri-apps/api/window";
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from "@tauri-apps/plugin-notification";
 
 type Mode = "idle" | "work" | "break";
 
@@ -96,19 +101,26 @@ function hide(el: HTMLElement) {
 
 async function ensureNotificationPermission() {
   try {
-    if ("Notification" in window && Notification.permission === "default") {
-      await Notification.requestPermission();
+    const granted = await isPermissionGranted();
+    if (!granted) {
+      await requestPermission();
     }
   } catch {
     // ignore
   }
 }
 
+async function notificationsEnabled(): Promise<boolean> {
+  try {
+    return await isPermissionGranted();
+  } catch {
+    return false;
+  }
+}
+
 function notify(title: string, body?: string) {
   try {
-    if ("Notification" in window && Notification.permission === "granted") {
-      new Notification(title, body ? { body } : undefined);
-    }
+    sendNotification({ title, body });
   } catch {
     // ignore
   }
@@ -212,6 +224,34 @@ function nextDurationMs(state: State) {
 
 let popupContext: "work-ended" | "break-ended" | null = null;
 
+let nagTimer: number | null = null;
+
+function stopNag() {
+  if (nagTimer != null) {
+    window.clearInterval(nagTimer);
+    nagTimer = null;
+  }
+}
+
+function startNag(kind: "break" | "work") {
+  stopNag();
+  // Repeat attention request + notification every 30s until user acknowledges.
+  nagTimer = window.setInterval(async () => {
+    try {
+      const w = getCurrentWindow();
+      await w.requestUserAttention(UserAttentionType.Critical);
+    } catch {
+      // ignore
+    }
+
+    if (kind === "break") {
+      notify("Break timer", "Time for a break");
+    } else {
+      notify("Break timer", "Break is done — back to work");
+    }
+  }, 30_000);
+}
+
 async function showBreakPopup() {
   popupContext = "work-ended";
   const popup = $("popup") as HTMLElement;
@@ -219,9 +259,12 @@ async function showBreakPopup() {
   ($("popup-text") as HTMLElement).textContent = "Stand up, move a bit, drink water.";
   ($("btn-break") as HTMLButtonElement).textContent = "Start break";
   show(popup);
+
+  await ensureNotificationPermission();
   await focusAndTop();
   beep();
   notify("Break timer", "Time for a break");
+  startNag("break");
 }
 
 async function showBackToWorkPopup() {
@@ -231,9 +274,12 @@ async function showBackToWorkPopup() {
   ($("popup-text") as HTMLElement).textContent = "Break is done. Ready for another round?";
   ($("btn-break") as HTMLButtonElement).textContent = "Start work";
   show(popup);
+
+  await ensureNotificationPermission();
   await focusAndTop();
   beep();
   notify("Break timer", "Break is done — back to work");
+  startNag("work");
 }
 
 async function main() {
@@ -284,6 +330,8 @@ async function main() {
   const btnSettingsCancel = $("btn-settings-cancel") as HTMLButtonElement;
   const btnSettingsSave = $("btn-settings-save") as HTMLButtonElement;
   const btnResetData = $("btn-reset-data") as HTMLButtonElement;
+  const notifStatus = $("notif-status") as HTMLElement;
+  const btnTestNotif = $("btn-test-notif") as HTMLButtonElement;
 
   const popup = $("popup") as HTMLElement;
   const btnSnooze = $("btn-snooze") as HTMLButtonElement;
@@ -364,12 +412,28 @@ async function main() {
   }
 
   // Settings
-  btnSettings.addEventListener("click", () => {
+  btnSettings.addEventListener("click", async () => {
     setWork.value = String(state.settings.workMinutes);
     setBreak.value = String(state.settings.breakMinutes);
+
+    // Update notification status each time settings opens.
+    const enabled = await notificationsEnabled();
+    notifStatus.textContent = enabled
+      ? "Enabled"
+      : "Disabled (allow notifications in system settings)";
+
     show(settingsModal);
   });
   btnSettingsCancel.addEventListener("click", () => hide(settingsModal));
+
+  btnTestNotif.addEventListener("click", async () => {
+    await ensureNotificationPermission();
+    notify("Break timer", "This is a test notification.");
+    const enabled = await notificationsEnabled();
+    notifStatus.textContent = enabled
+      ? "Enabled"
+      : "Disabled (allow notifications in system settings)";
+  });
 
   btnResetData.addEventListener("click", () => {
     // Clear persisted settings + state and reset to defaults.
@@ -411,6 +475,8 @@ async function main() {
 
   // Main controls
   btnStart.addEventListener("click", () => {
+    stopNag();
+
     // If we're waiting for an action after a popup, Start should do the right thing.
     if (state.awaiting === "break") {
       state.mode = "break";
@@ -439,6 +505,7 @@ async function main() {
   btnSnooze.addEventListener("click", async () => {
     // Snooze means: keep working for 5 more minutes.
     console.log("popup:snooze");
+    stopNag();
     popupContext = null;
     state.awaiting = "none";
     hide(popup);
@@ -451,6 +518,7 @@ async function main() {
 
   btnBreak.addEventListener("click", async () => {
     console.log("popup:primary", { popupContext, awaiting: state.awaiting });
+    stopNag();
     hide(popup);
 
     if (popupContext === "break-ended" || state.awaiting === "work") {
