@@ -8,8 +8,11 @@ type Settings = {
   breakMinutes: number;
 };
 
+type Awaiting = "none" | "break" | "work";
+
 type State = {
   mode: Mode;
+  awaiting: Awaiting;
   running: boolean;
   endsAtMs: number | null;
   remainingMs: number; // only used when paused/idle
@@ -47,17 +50,18 @@ function readState(): Omit<State, "settings"> {
   try {
     const raw = localStorage.getItem(LS_STATE);
     if (!raw) {
-      return { mode: "idle", running: false, endsAtMs: null, remainingMs: 0 };
+      return { mode: "idle", awaiting: "none", running: false, endsAtMs: null, remainingMs: 0 };
     }
     const j = JSON.parse(raw);
     return {
       mode: (j.mode as Mode) ?? "idle",
+      awaiting: (j.awaiting as Awaiting) ?? "none",
       running: Boolean(j.running),
       endsAtMs: typeof j.endsAtMs === "number" ? j.endsAtMs : null,
       remainingMs: typeof j.remainingMs === "number" ? j.remainingMs : 0,
     };
   } catch {
-    return { mode: "idle", running: false, endsAtMs: null, remainingMs: 0 };
+    return { mode: "idle", awaiting: "none", running: false, endsAtMs: null, remainingMs: 0 };
   }
 }
 
@@ -190,6 +194,7 @@ async function main() {
   const state: State = {
     settings,
     mode: persisted.mode,
+    awaiting: persisted.awaiting,
     running: persisted.running,
     endsAtMs: persisted.endsAtMs,
     remainingMs: persisted.remainingMs,
@@ -225,6 +230,7 @@ async function main() {
     writeSettings(state.settings);
     writeState({
       mode: state.mode,
+      awaiting: state.awaiting,
       running: state.running,
       endsAtMs: state.endsAtMs,
       remainingMs: state.remainingMs,
@@ -251,6 +257,7 @@ async function main() {
     state.running = true;
     state.endsAtMs = Date.now() + durationMs;
     state.remainingMs = durationMs;
+    state.awaiting = "none";
     persist();
     syncUi();
   }
@@ -277,6 +284,7 @@ async function main() {
     state.running = false;
     state.endsAtMs = null;
     state.remainingMs = 0;
+    state.awaiting = "break";
     persist();
     syncUi();
     await showBreakPopup();
@@ -286,6 +294,7 @@ async function main() {
     state.running = false;
     state.endsAtMs = null;
     state.remainingMs = 0;
+    state.awaiting = "work";
     persist();
     syncUi();
     await showBackToWorkPopup();
@@ -321,6 +330,18 @@ async function main() {
 
   // Main controls
   btnStart.addEventListener("click", () => {
+    // If we're waiting for an action after a popup, Start should do the right thing.
+    if (state.awaiting === "break") {
+      state.mode = "break";
+      startCountdown(msFromMinutes(state.settings.breakMinutes));
+      return;
+    }
+    if (state.awaiting === "work") {
+      state.mode = "work";
+      startCountdown(msFromMinutes(state.settings.workMinutes));
+      return;
+    }
+
     if (state.mode === "idle") state.mode = "work";
     startCountdown(state.remainingMs || nextDurationMs(state));
   });
@@ -337,6 +358,7 @@ async function main() {
   btnSnooze.addEventListener("click", async () => {
     // Snooze means: keep working for 5 more minutes.
     popupContext = null;
+    state.awaiting = "none";
     hide(popup);
     await dropTop();
     state.mode = "work";
@@ -347,7 +369,7 @@ async function main() {
     hide(popup);
     await dropTop();
 
-    if (popupContext === "break-ended") {
+    if (popupContext === "break-ended" || state.awaiting === "work") {
       popupContext = null;
       state.mode = "work";
       startCountdown(msFromMinutes(state.settings.workMinutes));
