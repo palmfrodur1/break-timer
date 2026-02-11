@@ -1,0 +1,71 @@
+name: Release (msi + dmg)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            artifact_name: macos
+          - os: windows-latest
+            artifact_name: windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Tauri prerequisites
+      - name: Install Tauri deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          # Ensure Xcode CLI tools (usually present on GitHub hosted runners)
+          xcode-select -p
+
+      - name: Install Tauri deps (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          # WiX is needed for MSI bundling
+          choco install wixtoolset -y
+
+      - name: Build (Tauri)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri build
+
+      - name: Upload bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}-bundles
+          path: |
+            src-tauri/target/release/bundle/**
+
+      - name: Create GitHub Release
+        if: runner.os == 'macOS'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/release/bundle/**
