@@ -232,6 +232,7 @@ async function main() {
   const setBreak = $("set-break") as HTMLInputElement;
   const btnSettingsCancel = $("btn-settings-cancel") as HTMLButtonElement;
   const btnSettingsSave = $("btn-settings-save") as HTMLButtonElement;
+  const btnResetData = $("btn-reset-data") as HTMLButtonElement;
 
   const popup = $("popup") as HTMLElement;
   const btnSnooze = $("btn-snooze") as HTMLButtonElement;
@@ -318,6 +319,24 @@ async function main() {
     show(settingsModal);
   });
   btnSettingsCancel.addEventListener("click", () => hide(settingsModal));
+
+  btnResetData.addEventListener("click", () => {
+    // Clear persisted settings + state and reset to defaults.
+    localStorage.removeItem(LS_SETTINGS);
+    localStorage.removeItem(LS_STATE);
+
+    state.settings = { ...DEFAULTS };
+    state.mode = "idle";
+    state.awaiting = "none";
+    state.running = false;
+    state.endsAtMs = null;
+    state.remainingMs = msFromMinutes(state.settings.workMinutes);
+
+    persist();
+    syncUi();
+    hide(settingsModal);
+  });
+
   btnSettingsSave.addEventListener("click", () => {
     const w = clamp(Number(setWork.value || 25), 1, 240);
     const b = clamp(Number(setBreak.value || 5), 1, 120);
